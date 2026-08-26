@@ -1,14 +1,15 @@
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 from django.db import IntegrityError, transaction
 from django.db.models import Sum
 from django.utils import timezone
 
-from billing.models import Invoice, LedgerEntry, Merchant, Payment, Project
+from billing.models import ExchangeRate, Invoice, LedgerEntry, Merchant, Payment, Project
 
 COMMISSION_RATE = Decimal("0.01")
 COMMISSION_MIN = Decimal("0.50")
 OVERPAID_TOLERANCE_RATE = Decimal("0.01")
+MONEY_QUANTUM = Decimal("0.01")
 
 # Счёт остаётся открытым до оплаты или истечения срока
 OPEN_STATUSES = (Invoice.Status.NEW, Invoice.Status.UNDERPAID)
@@ -18,7 +19,7 @@ class InvalidTransition(Exception):
     pass
 
 
-class UnsupportedCurrencyConversion(Exception):
+class ExchangeRateUnavailable(Exception):
     pass
 
 
@@ -53,16 +54,46 @@ def cancel_invoice(invoice: Invoice) -> Invoice:
         return locked
 
 
+def get_exchange_rate(currency_from: str, currency_to: str, at) -> Decimal:
+    rate_row = (
+        ExchangeRate.objects.filter(currency_from=currency_from, currency_to=currency_to, effective_at__lte=at)
+        .order_by("-effective_at")
+        .first()
+    )
+    if rate_row is None:
+        raise ExchangeRateUnavailable(
+            f"No exchange rate for {currency_from}->{currency_to} at or before {at.isoformat()}"
+        )
+    return rate_row.rate
+
+
+def _payment_amount_in_invoice_currency(payment: Payment, invoice_currency: str) -> Decimal:
+    if payment.currency == invoice_currency:
+        return payment.amount
+    converted = payment.amount * payment.exchange_rate_used
+    return converted.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
+
+
+def _total_received_in_invoice_currency(invoice: Invoice) -> Decimal:
+    total = Decimal("0")
+    for payment in invoice.payments.all():
+        total += _payment_amount_in_invoice_currency(payment, invoice.currency)
+    return total
+
+
 def invoice_remaining_amount(invoice: Invoice) -> Decimal:
-    received = invoice.payments.aggregate(total=Sum("amount"))["total"] or Decimal("0")
-    remaining = invoice.amount - received
+    total_received = _total_received_in_invoice_currency(invoice)
+    remaining = invoice.amount - total_received
     return remaining if remaining > 0 else Decimal("0")
 
 
 def record_payment(
     *, invoice: Invoice, provider_transaction_id: str, amount: Decimal, currency: str, received_at
 ) -> tuple[Payment, bool]:
-    """Обработка колбэка о поступлении"""
+    exchange_rate_used = None
+    if currency != invoice.currency:
+        exchange_rate_used = get_exchange_rate(currency, invoice.currency, received_at)
+
     with transaction.atomic():
         locked_invoice = Invoice.objects.select_for_update().get(pk=invoice.pk)
 
@@ -72,17 +103,13 @@ def record_payment(
         if existing is not None:
             return existing, False
 
-        if currency != locked_invoice.currency:
-            raise UnsupportedCurrencyConversion(
-                "Payment currency differs from invoice currency; conversion is not implemented yet"
-            )
-
         try:
             payment = Payment.objects.create(
                 invoice=locked_invoice,
                 provider_transaction_id=provider_transaction_id,
                 amount=amount,
                 currency=currency,
+                exchange_rate_used=exchange_rate_used,
                 received_at=received_at,
             )
         except IntegrityError:
@@ -91,7 +118,7 @@ def record_payment(
                 False,
             )
 
-        total_received = locked_invoice.payments.aggregate(total=Sum("amount"))["total"] or Decimal("0")
+        total_received = _total_received_in_invoice_currency(locked_invoice)
         _apply_invoice_status(locked_invoice, total_received)
 
         return payment, True

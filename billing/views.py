@@ -149,8 +149,8 @@ def internal_record_payment(request):
             currency=currency,
             received_at=received_at,
         )
-    except services.UnsupportedCurrencyConversion as exc:
-        return error_response(501, "unsupported_currency", str(exc))
+    except services.ExchangeRateUnavailable as exc:
+        return error_response(422, "exchange_rate_unavailable", str(exc))
 
     return JsonResponse(
         {
