@@ -160,6 +160,36 @@ def _settle_ledger(invoice: Invoice, total_received: Decimal) -> None:
     )
 
 
+DEFAULT_EXPIRE_BATCH_SIZE = 1000
+
+
+def expire_overdue_invoices(*, now=None, batch_size: int = DEFAULT_EXPIRE_BATCH_SIZE) -> int:
+    """Переводит просроченные счета в expired"""
+    now = now or timezone.now()
+    total_expired = 0
+
+    while True:
+        batch_ids = list(
+            Invoice.objects.filter(status__in=OPEN_STATUSES, expires_at__lt=now)
+            .order_by("id")
+            .values_list("id", flat=True)[:batch_size]
+        )
+        if not batch_ids:
+            break
+
+        with transaction.atomic():
+            updated = Invoice.objects.filter(
+                id__in=batch_ids, status__in=OPEN_STATUSES, expires_at__lt=now
+            ).update(status=Invoice.Status.EXPIRED)
+
+        total_expired += updated
+        if updated == 0:
+            # Все кандидаты из батча оказались уже обработаны или изменены, выходим из цикла
+            break
+
+    return total_expired
+
+
 def merchant_balance(merchant: Merchant) -> dict[str, Decimal]:
     rows = (
         LedgerEntry.objects.filter(merchant=merchant)
