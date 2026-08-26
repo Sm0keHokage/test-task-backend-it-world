@@ -18,6 +18,14 @@ Including another URLconf
 from django.contrib import admin
 from django.urls import path
 
+from billing import views
+
+
 urlpatterns = [
     path("admin/", admin.site.urls),
+    path("api/v1/invoices/", views.create_invoice, name="invoice-create"),
+    path("api/v1/invoices/<int:invoice_id>/", views.invoice_detail, name="invoice-detail"),
+    path("api/v1/invoices/<int:invoice_id>/cancel/", views.cancel_invoice, name="invoice-cancel"),
+    path("internal/payments/", views.internal_record_payment, name="internal-payments"),
+    path("api/v1/merchants/<int:merchant_id>/balance/", views.merchant_balance, name="merchant-balance"),
 ]
