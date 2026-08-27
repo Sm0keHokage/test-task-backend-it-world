@@ -3,7 +3,7 @@ from decimal import Decimal, InvalidOperation
 
 from django.http import JsonResponse
 from django.utils import timezone
-from django.utils.dateparse import parse_datetime
+from django.utils.dateparse import parse_date, parse_datetime
 from django.views.decorators.http import require_http_methods
 
 from billing import services
@@ -173,5 +173,46 @@ def merchant_balance(request, merchant_id):
         {
             "merchant_id": request.merchant.id,
             "balance": {currency: str(total) for currency, total in balance.items()},
+        }
+    )
+
+
+def _serialize_report_row(row: dict) -> dict:
+    serialized = dict(row)
+    for key in ("issued_amount", "received_amount", "commission_amount"):
+        serialized[key] = str(serialized[key])
+    return serialized
+
+
+@require_http_methods(["GET"])
+@require_project_api_key
+def merchant_report(request, merchant_id):
+    if request.merchant.id != merchant_id:
+        return error_response(403, "forbidden", "API key does not grant access to this merchant")
+
+    group_by = request.GET.get("group_by", "day")
+    date_from_raw = request.GET.get("date_from")
+    date_to_raw = request.GET.get("date_to")
+
+    date_from = parse_date(date_from_raw) if date_from_raw else None
+    if date_from_raw and date_from is None:
+        return error_response(400, "validation_error", "date_from must be in YYYY-MM-DD format")
+
+    date_to = parse_date(date_to_raw) if date_to_raw else None
+    if date_to_raw and date_to is None:
+        return error_response(400, "validation_error", "date_to must be in YYYY-MM-DD format")
+
+    try:
+        report = services.merchant_report(
+            merchant=request.merchant, date_from=date_from, date_to=date_to, group_by=group_by
+        )
+    except services.InvalidReportParameters as exc:
+        return error_response(400, "validation_error", str(exc))
+
+    return JsonResponse(
+        {
+            "merchant_id": request.merchant.id,
+            "group_by": group_by,
+            "report": [_serialize_report_row(row) for row in report],
         }
     )

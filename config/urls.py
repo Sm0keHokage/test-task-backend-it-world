@@ -28,4 +28,5 @@ urlpatterns = [
     path("api/v1/invoices/<int:invoice_id>/cancel/", views.cancel_invoice, name="invoice-cancel"),
     path("internal/payments/", views.internal_record_payment, name="internal-payments"),
     path("api/v1/merchants/<int:merchant_id>/balance/", views.merchant_balance, name="merchant-balance"),
+    path("api/v1/merchants/<int:merchant_id>/report/", views.merchant_report, name="merchant-report"),
 ]

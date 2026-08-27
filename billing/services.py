@@ -1,7 +1,8 @@
 from decimal import ROUND_HALF_UP, Decimal
 
 from django.db import IntegrityError, transaction
-from django.db.models import Sum
+from django.db.models import Count, F, Q, Sum
+from django.db.models.functions import TruncDate
 from django.utils import timezone
 
 from billing.models import ExchangeRate, Invoice, LedgerEntry, Merchant, Payment, Project
@@ -13,6 +14,16 @@ MONEY_QUANTUM = Decimal("0.01")
 
 # Счёт остаётся открытым до оплаты или истечения срока
 OPEN_STATUSES = (Invoice.Status.NEW, Invoice.Status.UNDERPAID)
+
+# Оплаченный для целей отчёта - счёт, по которому реально прошли деньги (полностью или с переплатой),
+# underpaid не считается оплаченным.
+PAID_LIKE_STATUSES = (Invoice.Status.PAID, Invoice.Status.OVERPAID)
+
+REPORT_GROUP_BY_CHOICES = ("day", "project")
+
+
+class InvalidReportParameters(Exception):
+    pass
 
 
 class InvalidTransition(Exception):
@@ -198,3 +209,71 @@ def merchant_balance(merchant: Merchant) -> dict[str, Decimal]:
         .order_by("currency")
     )
     return {row["currency"]: row["total"] for row in rows}
+
+
+def merchant_report(*, merchant: Merchant, date_from, date_to, group_by: str) -> list[dict]:
+    """Отчёт по мерчанту, сгруппированный по дню выставления счёта или по проекту"""
+    if group_by not in REPORT_GROUP_BY_CHOICES:
+        raise InvalidReportParameters(f"group_by must be one of {REPORT_GROUP_BY_CHOICES}")
+
+    invoice_qs = Invoice.objects.filter(project__merchant=merchant)
+    ledger_qs = LedgerEntry.objects.filter(merchant=merchant, invoice__isnull=False)
+
+    if date_from is not None:
+        invoice_qs = invoice_qs.filter(created_at__date__gte=date_from)
+        ledger_qs = ledger_qs.filter(invoice__created_at__date__gte=date_from)
+    if date_to is not None:
+        invoice_qs = invoice_qs.filter(created_at__date__lte=date_to)
+        ledger_qs = ledger_qs.filter(invoice__created_at__date__lte=date_to)
+
+    if group_by == "day":
+        group_field = "day"
+        invoice_groups = invoice_qs.annotate(day=TruncDate("created_at"))
+        ledger_groups = ledger_qs.annotate(day=TruncDate("invoice__created_at"))
+        project_names = None
+    else:
+        group_field = "project_id"
+        invoice_groups = invoice_qs
+        ledger_groups = ledger_qs.annotate(project_id=F("invoice__project_id"))
+        project_names = dict(Project.objects.filter(merchant=merchant).values_list("id", "name"))
+
+    invoice_rows = (
+        invoice_groups.values(group_field)
+        .annotate(
+            issued_count=Count("id"),
+            paid_count=Count("id", filter=Q(status__in=PAID_LIKE_STATUSES)),
+            issued_amount=Sum("amount"),
+        )
+        .order_by(group_field)
+    )
+    ledger_rows = ledger_groups.values(group_field).annotate(
+        received_amount=Sum("amount", filter=Q(entry_type=LedgerEntry.EntryType.CREDIT)),
+        commission_amount=Sum("amount", filter=Q(entry_type=LedgerEntry.EntryType.COMMISSION)),
+    )
+
+    ledger_by_key = {row[group_field]: row for row in ledger_rows}
+
+    report = []
+    for row in invoice_rows:
+        key = row[group_field]
+        ledger_row = ledger_by_key.get(key, {})
+        issued_count = row["issued_count"]
+        paid_count = row["paid_count"]
+
+        entry = {
+            "issued_count": issued_count,
+            "paid_count": paid_count,
+            "issued_amount": row["issued_amount"] or Decimal("0"),
+            "received_amount": ledger_row.get("received_amount") or Decimal("0"),
+            "commission_amount": abs(ledger_row.get("commission_amount") or Decimal("0")),
+            "conversion": round(paid_count / issued_count, 4) if issued_count else 0.0,
+        }
+        if group_by == "day":
+            entry["day"] = key.isoformat()
+        else:
+            entry["project_id"] = key
+            entry["project_name"] = project_names.get(key, "")
+
+        report.append(entry)
+
+    return report
