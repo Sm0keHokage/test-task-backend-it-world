@@ -15,12 +15,18 @@ services:
       timeout: 5s
       retries: 10
 
+  rates:
+    build: ./rates_service
+    ports:
+      - "8011:8001"
+
   web:
     build: .
     env_file:
       - .env
     environment:
       DATABASE_URL: postgres://payments:payments@db:5432/payments
+      RATES_SERVICE_URL: http://rates:8001
     depends_on:
       db:
         condition: service_healthy

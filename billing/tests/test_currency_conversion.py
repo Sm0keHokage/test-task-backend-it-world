@@ -1,5 +1,6 @@
 import json
 from decimal import Decimal
+from unittest.mock import MagicMock, patch
 
 import pytest
 from django.conf import settings
@@ -7,6 +8,7 @@ from django.test import Client
 from django.urls import reverse
 from django.utils import timezone
 
+from billing import services
 from billing.models import ExchangeRate, Invoice, LedgerEntry, Merchant, Project
 
 pytestmark = pytest.mark.django_db
@@ -156,3 +158,41 @@ def test_partial_foreign_currency_payments_accumulate_towards_invoice_amount(cli
 
     response = client.get(reverse("invoice-detail", args=[invoice.id]), HTTP_X_API_KEY="secret-key")
     assert response.json()["remaining_amount"] == "0"
+
+
+@patch("billing.rates_client.urllib.request.urlopen")
+def test_falls_back_to_rates_service_when_no_db_rate_and_persists_snapshot(mock_urlopen, settings):
+    settings.RATES_SERVICE_URL = "http://rates.example.com"
+    response = MagicMock()
+    response.status = 200
+    response.read.return_value = b'{"currency_from": "EUR", "currency_to": "USD", "rate": "1.11"}'
+    response.__enter__.return_value = response
+    response.__exit__.return_value = False
+    mock_urlopen.return_value = response
+
+    at = timezone.now()
+    rate = services.get_exchange_rate("EUR", "USD", at)
+
+    assert rate == Decimal("1.11")
+    assert mock_urlopen.call_count == 1
+    assert ExchangeRate.objects.filter(currency_from="EUR", currency_to="USD", effective_at=at).exists()
+
+    rate_again = services.get_exchange_rate("EUR", "USD", at + timezone.timedelta(minutes=1))
+    assert rate_again == Decimal("1.11")
+    assert mock_urlopen.call_count == 1
+
+
+def test_raises_when_no_db_rate_and_rates_service_not_configured():
+    with pytest.raises(services.ExchangeRateUnavailable):
+        services.get_exchange_rate("EUR", "USD", timezone.now())
+
+
+@patch("billing.rates_client.urllib.request.urlopen")
+def test_raises_when_no_db_rate_and_rates_service_unreachable(mock_urlopen, settings):
+    import urllib.error
+
+    settings.RATES_SERVICE_URL = "http://rates.example.com"
+    mock_urlopen.side_effect = urllib.error.URLError("connection refused")
+
+    with pytest.raises(services.ExchangeRateUnavailable):
+        services.get_exchange_rate("EUR", "USD", timezone.now())

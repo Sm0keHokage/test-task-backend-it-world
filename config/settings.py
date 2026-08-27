@@ -31,6 +31,8 @@ DEBUG = env.bool("DJANGO_DEBUG", default=True)
 ALLOWED_HOSTS = env.list("DJANGO_ALLOWED_HOSTS", default=["*"])
 
 INTERNAL_PAYMENTS_TOKEN = env("INTERNAL_PAYMENTS_TOKEN", default="dev-internal-token")
+
+RATES_SERVICE_URL = env("RATES_SERVICE_URL", default="")
 # Application definition
 
 INSTALLED_APPS = [

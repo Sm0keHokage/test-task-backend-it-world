@@ -5,6 +5,7 @@ from django.db.models import Count, F, Q, Sum
 from django.db.models.functions import TruncDate
 from django.utils import timezone
 
+from billing import rates_client
 from billing.models import ExchangeRate, Invoice, LedgerEntry, Merchant, NotificationDelivery, Payment, Project
 
 COMMISSION_RATE = Decimal("0.01")
@@ -86,15 +87,30 @@ def cancel_invoice(invoice: Invoice) -> Invoice:
 
 
 def get_exchange_rate(currency_from: str, currency_to: str, at) -> Decimal:
+    """ Курс, действовавший на момент поступления, сначала смотрим в бд, если нет,
+        то идем в отдельный сервис """
     rate_row = (
         ExchangeRate.objects.filter(currency_from=currency_from, currency_to=currency_to, effective_at__lte=at)
         .order_by("-effective_at")
         .first()
     )
-    if rate_row is None:
+    if rate_row is not None:
+        return rate_row.rate
+
+    try:
+        rate = rates_client.fetch_rate(currency_from, currency_to)
+    except rates_client.RatesServiceUnavailable as exc:
         raise ExchangeRateUnavailable(
-            f"No exchange rate for {currency_from}->{currency_to} at or before {at.isoformat()}"
-        )
+            f"No exchange rate for {currency_from}->{currency_to} at or before {at.isoformat()} "
+            f"(rates service also unavailable: {exc})"
+        ) from exc
+
+    rate_row, _ = ExchangeRate.objects.get_or_create(
+        currency_from=currency_from,
+        currency_to=currency_to,
+        effective_at=at,
+        defaults={"rate": rate},
+    )
     return rate_row.rate
 
 
