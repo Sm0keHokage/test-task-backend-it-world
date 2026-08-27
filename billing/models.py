@@ -1,3 +1,5 @@
+import secrets
+
 from django.db import models
 
 
@@ -22,6 +24,7 @@ class Project(models.Model):
     name = models.CharField(max_length=255)
     api_key = models.CharField(max_length=64, unique=True)
     webhook_url = models.URLField(max_length=2048, blank=True)
+    webhook_secret = models.CharField(max_length=64, default=secrets.token_hex, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -163,3 +166,32 @@ class ExchangeRate(models.Model):
 
     def __str__(self):
         return f"{self.currency_from}->{self.currency_to} @ {self.effective_at}: {self.rate}"
+
+
+class NotificationDelivery(models.Model):
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        DELIVERED = "delivered", "Delivered"
+        FAILED = "failed", "Failed"
+
+    invoice = models.OneToOneField(
+        Invoice, on_delete=models.PROTECT, related_name="notification_delivery"
+    )
+    event_type = models.CharField(max_length=32)
+    payload = models.JSONField()
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING)
+    attempts = models.PositiveIntegerField(default=0)
+    next_attempt_at = models.DateTimeField()
+    last_error = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "notification_delivery"
+        indexes = [
+            models.Index(fields=["status", "next_attempt_at"], name="ix_notif_status_next_attempt"),
+        ]
+
+    def __str__(self):
+        return f"NotificationDelivery#{self.pk} invoice={self.invoice_id} ({self.status})"

@@ -5,7 +5,7 @@ from django.db.models import Count, F, Q, Sum
 from django.db.models.functions import TruncDate
 from django.utils import timezone
 
-from billing.models import ExchangeRate, Invoice, LedgerEntry, Merchant, Payment, Project
+from billing.models import ExchangeRate, Invoice, LedgerEntry, Merchant, NotificationDelivery, Payment, Project
 
 COMMISSION_RATE = Decimal("0.01")
 COMMISSION_MIN = Decimal("0.50")
@@ -20,6 +20,25 @@ OPEN_STATUSES = (Invoice.Status.NEW, Invoice.Status.UNDERPAID)
 PAID_LIKE_STATUSES = (Invoice.Status.PAID, Invoice.Status.OVERPAID)
 
 REPORT_GROUP_BY_CHOICES = ("day", "project")
+
+
+def _enqueue_terminal_notification(invoice: Invoice) -> None:
+    """Ставит уведомление в очередь при входе счёта в терминальный статус"""
+    NotificationDelivery.objects.get_or_create(
+        invoice=invoice,
+        defaults={
+            "event_type": invoice.status,
+            "payload": {
+                "invoice_id": invoice.id,
+                "merchant_external_id": invoice.merchant_external_id,
+                "project_id": invoice.project_id,
+                "status": invoice.status,
+                "amount": str(invoice.amount),
+                "currency": invoice.currency,
+            },
+            "next_attempt_at": timezone.now(),
+        },
+    )
 
 
 class InvalidReportParameters(Exception):
@@ -62,6 +81,7 @@ def cancel_invoice(invoice: Invoice) -> Invoice:
             raise InvalidTransition(f"Cannot cancel invoice in status '{locked.status}'")
         locked.status = Invoice.Status.CANCELLED
         locked.save(update_fields=["status"])
+        _enqueue_terminal_notification(locked)
         return locked
 
 
@@ -146,6 +166,7 @@ def _apply_invoice_status(invoice: Invoice, total_received: Decimal) -> None:
     invoice.save(update_fields=["status"])
 
     _settle_ledger(invoice, total_received)
+    _enqueue_terminal_notification(invoice)
 
 
 def _settle_ledger(invoice: Invoice, total_received: Decimal) -> None:
@@ -192,6 +213,10 @@ def expire_overdue_invoices(*, now=None, batch_size: int = DEFAULT_EXPIRE_BATCH_
             updated = Invoice.objects.filter(
                 id__in=batch_ids, status__in=OPEN_STATUSES, expires_at__lt=now
             ).update(status=Invoice.Status.EXPIRED)
+
+            if updated:
+                for invoice in Invoice.objects.filter(id__in=batch_ids, status=Invoice.Status.EXPIRED):
+                    _enqueue_terminal_notification(invoice)
 
         total_expired += updated
         if updated == 0:
